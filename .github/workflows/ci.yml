@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: zenbu-cloud
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +45,7 @@ jobs:
   build-and-push:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
     needs: test
-    runs-on: zenbu-cloud
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
@@ -81,129 +81,3 @@ jobs:
             .
           docker push ghcr.io/zenbuapps/zenbu-roadmaps-web:${{ steps.tag.outputs.sha }}
           docker push ghcr.io/zenbuapps/zenbu-roadmaps-web:latest
-
-  deploy:
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
-    needs: build-and-push
-    runs-on: zenbu-cloud
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install kubectl & Helm
-        run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          sudo install -m 0755 kubectl /usr/local/bin/kubectl
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | sudo bash
-
-      - name: Configure kubeconfig
-        run: |
-          SA_TOKEN_PATH="/var/run/secrets/kubernetes.io/serviceaccount"
-          if [ -f "${SA_TOKEN_PATH}/token" ]; then
-            kubectl config set-cluster in-cluster \
-              --server=https://kubernetes.default.svc \
-              --certificate-authority=${SA_TOKEN_PATH}/ca.crt
-            kubectl config set-credentials sa-user \
-              --token=$(cat ${SA_TOKEN_PATH}/token)
-            kubectl config set-context in-cluster \
-              --cluster=in-cluster --user=sa-user
-            kubectl config use-context in-cluster
-          fi
-
-      - name: Verify cluster access
-        run: kubectl get nodes
-
-      - name: Calculate image tag
-        id: tag
-        run: echo "sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-
-      - name: Clean up stuck releases
-        run: |
-          NAMESPACE="zenburoadmaps-prod"
-          RELEASE="zenbu-roadmaps"
-          STATUS=$(helm status $RELEASE -n $NAMESPACE 2>/dev/null | grep STATUS | awk '{print $2}' || echo "not-found")
-          if [ "$STATUS" = "failed" ]; then
-            echo "Uninstalling failed release..."
-            helm uninstall $RELEASE -n $NAMESPACE || true
-          elif [[ "$STATUS" == pending-* ]]; then
-            echo "Rolling back pending release..."
-            helm rollback $RELEASE 0 -n $NAMESPACE || true
-          fi
-
-      - name: Create GHCR pull secret
-        run: |
-          GHCR_SECRET=$(echo -n '{"auths":{"ghcr.io":{"auth":"'$(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w0)'"}}}' | base64 -w0)
-          echo "GHCR_SECRET=$GHCR_SECRET" >> "$GITHUB_ENV"
-
-      - name: Deploy with Helm
-        env:
-          IMAGE_TAG: ${{ steps.tag.outputs.sha }}
-          DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
-          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
-          SESSION_COOKIE_SECURE: ${{ secrets.SESSION_COOKIE_SECURE }}
-          APP_BASE_URL: ${{ secrets.APP_BASE_URL }}
-          CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
-          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
-          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
-          GOOGLE_OAUTH_CALLBACK_URL: ${{ secrets.GOOGLE_OAUTH_CALLBACK_URL }}
-          ZENBU_ORG_WRITE_TOKEN: ${{ secrets.ZENBU_ORG_WRITE_TOKEN }}
-          INITIAL_ADMIN_EMAILS: ${{ secrets.INITIAL_ADMIN_EMAILS }}
-          BUNNY_CDN_URL: ${{ secrets.BUNNY_CDN_URL }}
-          BUNNY_STORAGE_HOST: ${{ secrets.BUNNY_STORAGE_HOST }}
-          BUNNY_STORAGE_ZONE: ${{ secrets.BUNNY_STORAGE_ZONE }}
-          BUNNY_STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
-        run: |
-          set -eu
-          DATABASE_URL="postgresql://zenburoadmaps:${DB_PASSWORD}@zenburoadmaps-postgresql:5432/zenburoadmaps"
-
-          # Escape ' to '' for YAML single-quoted scalar
-          yq_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
-
-          # Write all values to an override file. `-f` avoids `helm --set`
-          # interpreting commas inside secret values (e.g. CORS_ALLOWED_ORIGINS,
-          # INITIAL_ADMIN_EMAILS) as field separators.
-          OVERRIDE_FILE="$(mktemp -t helm-override.XXXXXX.yaml)"
-          trap 'rm -f "$OVERRIDE_FILE"' EXIT
-
-          cat > "$OVERRIDE_FILE" <<EOF
-          api:
-            image:
-              tag: '$(yq_escape "$IMAGE_TAG")'
-            secrets:
-              DATABASE_URL: '$(yq_escape "$DATABASE_URL")'
-              SESSION_SECRET: '$(yq_escape "$SESSION_SECRET")'
-              SESSION_COOKIE_SECURE: '$(yq_escape "$SESSION_COOKIE_SECURE")'
-              APP_BASE_URL: '$(yq_escape "$APP_BASE_URL")'
-              CORS_ALLOWED_ORIGINS: '$(yq_escape "$CORS_ALLOWED_ORIGINS")'
-              GOOGLE_OAUTH_CLIENT_ID: '$(yq_escape "$GOOGLE_OAUTH_CLIENT_ID")'
-              GOOGLE_OAUTH_CLIENT_SECRET: '$(yq_escape "$GOOGLE_OAUTH_CLIENT_SECRET")'
-              GOOGLE_OAUTH_CALLBACK_URL: '$(yq_escape "$GOOGLE_OAUTH_CALLBACK_URL")'
-              ZENBU_ORG_WRITE_TOKEN: '$(yq_escape "$ZENBU_ORG_WRITE_TOKEN")'
-              INITIAL_ADMIN_EMAILS: '$(yq_escape "$INITIAL_ADMIN_EMAILS")'
-              BUNNY_CDN_URL: '$(yq_escape "$BUNNY_CDN_URL")'
-              BUNNY_STORAGE_HOST: '$(yq_escape "$BUNNY_STORAGE_HOST")'
-              BUNNY_STORAGE_ZONE: '$(yq_escape "$BUNNY_STORAGE_ZONE")'
-              BUNNY_STORAGE_PASSWORD: '$(yq_escape "$BUNNY_STORAGE_PASSWORD")'
-          web:
-            image:
-              tag: '$(yq_escape "$IMAGE_TAG")'
-          imagePullSecret: '$(yq_escape "$GHCR_SECRET")'
-          postgresql:
-            password: '$(yq_escape "$DB_PASSWORD")'
-          EOF
-
-          helm upgrade --install zenbu-roadmaps helm/zenbu-roadmaps/ \
-            -n zenburoadmaps-prod \
-            -f "$OVERRIDE_FILE"
-
-      - name: Verify deployment
-        run: |
-          kubectl rollout status deployment/zenburoadmaps-api -n zenburoadmaps-prod --timeout=120s
-          kubectl rollout status deployment/zenburoadmaps-web -n zenburoadmaps-prod --timeout=120s
-
-      - name: Show deployment status
-        if: always()
-        run: |
-          kubectl get pods -n zenburoadmaps-prod
-          kubectl get svc -n zenburoadmaps-prod
-          kubectl get gateway -n zenburoadmaps-prod
-          kubectl get httproute -n zenburoadmaps-prod
